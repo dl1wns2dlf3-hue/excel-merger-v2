@@ -1,206 +1,128 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import openpyxl
-import re
 import io
+import re
 from datetime import datetime
 
-# --- [핵심 추가] 메모리 폭발 방지 전처리 함수 ---
-def safe_read_excel(file_obj):
-    """
-    무거운 엑셀 파일을 통째로 읽지 않고, read_only 모드로 가볍게 한 줄씩 읽습니다.
-    빈 줄이 연속으로 50번 이상 나오면 '유령 데이터'로 간주하고 과감히 잘라냅니다.
-    """
-    # 메모리 절약을 위한 read_only=True 적용
-    wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
-    sheets_data = {}
-    
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        data = []
-        empty_row_count = 0
-        
-        # 한 줄씩 값을 읽어옴
-        for row in ws.iter_rows(values_only=True):
-            # 현재 줄이 완전히 비어있는지 확인
-            is_empty = all(cell is None or str(cell).strip() == '' for cell in row)
-            
-            if is_empty:
-                empty_row_count += 1
-                # 빈 줄이 50번 연속으로 나오면 '끝'으로 간주하고 즉시 읽기 종료! (메모리 세이브)
-                if empty_row_count > 50:
-                    break
-            else:
-                empty_row_count = 0
-            
-            data.append(row)
-            
-        if data:
-            sheets_data[sheet_name] = pd.DataFrame(data) # 판다스 데이터프레임으로 안전하게 변환
-            
-    wb.close()
-    return sheets_data
-
-
-# --- [공통 함수] 시드 파일에서 데이터 추출 ---
-def load_seed_data(file_obj):
-    empty_df = pd.DataFrame(columns=['이름_key', '생년월일_val', '업체_val', '직종_val'])
-    if file_obj is None: 
-        return empty_df
-    
+# --- [전처리] 메모리 점유율을 최소화하여 엑셀 읽기 ---
+def load_data_fast(file_obj):
+    if file_obj is None:
+        return pd.DataFrame()
     try:
-        # 기존에 메모리를 터뜨리던 pd.read_excel 대신, 직접 만든 전처리 함수 사용!
-        sheets = safe_read_excel(file_obj)
-    except Exception as e:
-        st.error(f"파일 전처리 중 오류 발생 ({file_obj.name}): {e}")
-        return empty_df
+        # 파일을 읽을 때 상위 5000줄까지만 제한하여 유령 데이터 방지
+        # engine='openpyxl'을 명시하고, 수식이 아닌 결과값만 가져오도록 설정
+        df = pd.read_excel(file_obj, header=None, engine='openpyxl', nrows=5000)
         
-    df_list = []
-    for sheet_name, df_raw in sheets.items():
-        if df_raw is None or df_raw.empty: continue
-            
+        # 1. 헤더(이름/성명) 위치 찾기
         header_idx = -1
-        for idx, row in df_raw.head(20).iterrows():
-            row_clean = [str(cell).replace(' ', '').replace('\n', '').strip() for cell in row]
-            if '성명' in row_clean or '이름' in row_clean:
+        for idx, row in df.head(20).iterrows():
+            row_vals = [str(c).replace(' ', '').strip() for c in row if pd.notna(c)]
+            if '성명' in row_vals or '이름' in row_vals:
                 header_idx = idx
                 break
         
-        if header_idx != -1:
-            df = df_raw.iloc[header_idx + 1:].copy()
-            cols = [str(c).replace(' ', '').replace('\n', '').strip() for c in df_raw.iloc[header_idx].values]
-            df.columns = cols
-            df = df.loc[:, ~df.columns.duplicated()].copy()
-            df_list.append(df)
-            
-    if not df_list: 
-        return empty_df
-    
-    combined_df = pd.concat(df_list, ignore_index=True)
-    
-    name_col = next((c for c in ['이름', '성명'] if c in combined_df.columns), None)
-    if not name_col: 
-        return empty_df
-    
-    result_df = pd.DataFrame()
-    result_df['이름_key'] = combined_df[name_col].astype(str).str.replace(r'\s+', '', regex=True).str.strip()
-    
-    def clean_date(x):
-        if pd.isna(x) or str(x).strip() in ['', 'nan', 'NaT', 'None']: return ''
-        s = str(x).strip()
-        if s.endswith('.0'): s = s[:-2]
-        s = s.split(' ')[0]
-        return re.sub(r'\D', '', s)
+        if header_idx == -1:
+            return pd.DataFrame()
 
-    if '생년월일' in combined_df.columns:
-        result_df['생년월일_val'] = combined_df['생년월일'].apply(clean_date)
-    else:
-        result_df['생년월일_val'] = ''
+        # 2. 헤더 기준 데이터 재설정
+        df.columns = [str(c).replace(' ', '').strip() for c in df.iloc[header_idx]]
+        df = df.iloc[header_idx + 1:].reset_index(drop=True)
         
-    comp_col = next((c for c in ['업체명', '업체', '소속'] if c in combined_df.columns), None)
-    result_df['업체_val'] = combined_df[comp_col].astype(str).str.strip().replace('nan', '') if comp_col else ''
-    
-    job_col = next((c for c in ['직종명', '직종', '공종', '직책'] if c in combined_df.columns), None)
-    result_df['직종_val'] = combined_df[job_col].astype(str).str.strip().replace('nan', '') if job_col else ''
-    
-    result_df = result_df[result_df['이름_key'].notna() & (result_df['이름_key'] != '') & (result_df['이름_key'] != 'nan')]
-    return result_df
+        # 3. 필요한 열만 필터링 (메모리 절약)
+        name_col = next((c for c in ['이름', '성명'] if c in df.columns), None)
+        if not name_col:
+            return pd.DataFrame()
 
-# --- [웹 UI 설정] ---
-st.set_page_config(page_title="근로자 데이터 병합기", page_icon="👷", layout="centered")
+        res = pd.DataFrame()
+        res['이름_key'] = df[name_col].astype(str).str.replace(r'\s+', '', regex=True).str.strip()
+        
+        # 생년월일/업체/직종 추출 (열이 있을 때만)
+        dob_col = '생년월일' if '생년월일' in df.columns else None
+        comp_col = next((c for c in ['업체명', '업체', '소속'] if c in df.columns), None)
+        job_col = next((c for c in ['직종명', '직종', '공종', '직책'] if c in df.columns), None)
 
-st.title("👷 근로자 데이터 자동 병합 시스템")
-st.info("시드 파일(1번, 2번) 중 하나만 올려도 작동합니다. 타겟 파일의 빈칸을 자동으로 채워줍니다.")
+        if dob_col:
+            res['생년월일_val'] = df[dob_col].astype(str).apply(lambda x: re.sub(r'\D', '', x.split(' ')[0]) if x != 'nan' else '')
+        else: res['생년월일_val'] = ''
+        
+        res['업체_val'] = df[comp_col].astype(str).str.strip().replace('nan', '') if comp_col else ''
+        res['직종_val'] = df[job_col].astype(str).str.strip().replace('nan', '') if job_col else ''
 
-seed1_file = st.file_uploader("1. 첫 번째 시드 파일 (선택)", type=["xlsx"])
-seed2_file = st.file_uploader("2. 두 번째 시드 파일 (선택)", type=["xlsx"])
-target_file = st.file_uploader("3. 작성하려는 타겟 파일 (필수)", type=["xlsx"])
+        # 유효한 이름 데이터만 남기기
+        return res[res['이름_key'].str.len() > 1].drop_duplicates('이름_key')
+    except Exception as e:
+        st.error(f"파일 처리 실패: {e}")
+        return pd.DataFrame()
 
-if st.button("데이터 병합 실행 🚀"):
-    if not target_file:
-        st.error("작성하려는 타겟 파일을 업로드해주세요.")
-    elif not seed1_file and not seed2_file:
-        st.error("데이터를 가져올 시드 파일(1번 혹은 2번)을 최소 하나는 올려주세요.")
+# --- [UI] ---
+st.set_page_config(page_title="현장 데이터 병합기", layout="centered")
+st.title("👷 건설현장 근로자 데이터 병합")
+st.info("5MB 이상의 무거운 파일도 최적화하여 읽어옵니다. 시드 파일은 1번이나 2번 중 하나만 있어도 작동합니다.")
+
+s1 = st.file_uploader("1번 시드 (정보 원본)", type=["xlsx"])
+s2 = st.file_uploader("2번 시드 (추가 정보)", type=["xlsx"])
+target = st.file_uploader("타겟 파일 (빈칸 채울 양식)", type=["xlsx"])
+
+if st.button("병합 시작 🚀"):
+    if not target or (not s1 and not s2):
+        st.warning("파일을 업로드해주세요.")
     else:
-        with st.spinner('무거운 엑셀 파일을 최적화하여 읽어오는 중입니다...'):
-            try:
-                df_s1 = load_seed_data(seed1_file)
-                df_s2 = load_seed_data(seed2_file)
-                df_seeds = pd.concat([df_s1, df_s2], ignore_index=True)
-                
-                if df_seeds.empty:
-                    st.error("시드 파일에서 유효한 명단 데이터를 찾지 못했습니다.")
-                    st.stop()
-                
-                df_seeds['score'] = (df_seeds['생년월일_val'] != '').astype(int) + \
-                                   (df_seeds['업체_val'] != '').astype(int) + \
-                                   (df_seeds['직종_val'] != '').astype(int)
-                df_seeds = df_seeds.sort_values('score', ascending=False).drop_duplicates(subset=['이름_key'], keep='first')
+        with st.spinner('대용량 파일 최적화 중...'):
+            # 데이터 로드
+            df1 = load_data_fast(s1)
+            df2 = load_data_fast(s2)
+            seeds = pd.concat([df1, df2]).drop_duplicates('이름_key', keep='first')
 
-                # 타겟 파일 처리
-                wb = openpyxl.load_workbook(target_file)
-                target_sheet = None
-                header_row_idx = 1
-                col_indices = {}
+            if seeds.empty:
+                st.error("시드 파일에서 명단을 찾을 수 없습니다. 파일 양식을 확인해주세요.")
+                st.stop()
+
+            # 타겟 파일 처리 (Openpyxl 직접 수정)
+            wb = openpyxl.load_workbook(target, data_only=True)
+            ws = wb.active # 첫 번째 시트 사용
+            
+            # 헤더 찾기
+            h_idx = -1
+            cols = {}
+            for r in range(1, 21):
+                row = [str(ws.cell(r, c).value).replace(' ', '').strip() for c in range(1, ws.max_column + 1)]
+                if '이름' in row or '성명' in row:
+                    h_idx = r
+                    for i, val in enumerate(row, 1):
+                        if val and val != 'None': cols[val] = i
+                    break
+
+            if h_idx == -1:
+                st.error("타겟 양식에서 '이름' 열을 찾지 못했습니다.")
+                st.stop()
+
+            n_k = '이름' if '이름' in cols else '성명'
+            t_d = '생년월일' if '생년월일' in cols else None
+            t_c = next((k for k in ['업체명', '업체', '소속'] if k in cols), None)
+            t_j = next((k for k in ['직종명', '직종', '공종', '직책'] if k in cols), None)
+
+            count = 0
+            for r in range(h_idx + 1, ws.max_row + 1):
+                name_cell = ws.cell(r, cols[n_k]).value
+                if not name_cell: continue
+                name = str(name_cell).replace(' ', '').strip()
                 
-                for sheetname in wb.sheetnames:
-                    ws = wb[sheetname]
-                    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=20, values_only=True), 1):
-                        row_strs = [str(cell).replace(' ', '').replace('\n', '').strip() if cell else '' for cell in row]
-                        if '이름' in row_strs or '성명' in row_strs:
-                            target_sheet = ws
-                            header_row_idx = row_idx
-                            for col_idx, val in enumerate(row_strs, 1):
-                                if val: col_indices[val] = col_idx
-                            break
-                    if target_sheet: break
-                        
-                if not target_sheet:
-                    st.error("타겟 파일에서 '이름' 또는 '성명' 열이 있는 시트를 찾지 못했습니다.")
-                    st.stop()
+                match = seeds[seeds['이름_key'] == name]
+                if not match.empty:
+                    res = match.iloc[0]
+                    if t_d and not ws.cell(r, cols[t_d]).value: ws.cell(r, cols[t_d]).value = res['생년월일_val']
+                    if t_c and not ws.cell(r, cols[t_c]).value: ws.cell(r, cols[t_c]).value = res['업체_val']
+                    if t_j and not ws.cell(r, cols[t_j]).value: ws.cell(r, cols[t_j]).value = res['직종_val']
+                    count += 1
 
-                name_key = '이름' if '이름' in col_indices else '성명'
-                t_dob = '생년월일' if '생년월일' in col_indices else None
-                t_comp = next((k for k in ['업체명', '업체', '소속'] if k in col_indices), None)
-                t_job = next((k for k in ['직종명', '직종', '공종', '직책'] if k in col_indices), None)
-
-                fill_count = 0
-                for r in range(header_row_idx + 1, target_sheet.max_row + 1):
-                    name_val = target_sheet.cell(row=r, column=col_indices[name_key]).value
-                    if not name_val: continue
-                    
-                    name = str(name_val).replace(' ', '').replace('\n', '').strip()
-                    if not name or name == 'None': continue
-                    
-                    match = df_seeds[df_seeds['이름_key'] == name]
-                    if not match.empty:
-                        s_row = match.iloc[0]
-                        if t_dob:
-                            cell = target_sheet.cell(row=r, column=col_indices[t_dob])
-                            if not cell.value or str(cell.value).strip() == '':
-                                cell.value = s_row['생년월일_val']
-                                fill_count += 1
-                        if t_comp:
-                            cell = target_sheet.cell(row=r, column=col_indices[t_comp])
-                            if not cell.value or str(cell.value).strip() == '':
-                                cell.value = s_row['업체_val']
-                        if t_job:
-                            cell = target_sheet.cell(row=r, column=col_indices[t_job])
-                            if not cell.value or str(cell.value).strip() == '':
-                                cell.value = s_row['직종_val']
-
-                output = io.BytesIO()
-                wb.save(output)
-                output.seek(0)
-                
-                today = datetime.now().strftime("%Y%m%d")
-                st.success(f"✅ 병합 완료! (총 {fill_count}개의 항목을 확인/업데이트 했습니다.)")
-                st.download_button(
-                    label="📥 병합된 결과 파일 다운로드",
-                    data=output,
-                    file_name=f"{today}_병합결과_{target_file.name}",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            except Exception as e:
-                st.error(f"처리 중 예상치 못한 오류가 발생했습니다: {e}")
+            out = io.BytesIO()
+            wb.save(out)
+            
+            st.success(f"✅ {count}명 매칭 완료!")
+            st.download_button(
+                label="📥 결과 다운로드", 
+                data=out.getvalue(), 
+                file_name=f"병합완료_{datetime.now().strftime('%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
